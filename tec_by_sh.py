@@ -1,6 +1,5 @@
 import numpy as np
 import pandas as pd
-import pyshtools as sh
 import cartopy.crs as ccrs
 import matplotlib.pyplot as plt
 from pathlib import Path
@@ -8,7 +7,27 @@ from scipy.special import lpmv
 from scipy.spatial import cKDTree
 from scipy.ndimage import gaussian_filter
 import warnings
+
+from PlotTECGlobal import read_ionex_fixed, create_tec_matrix
+
 warnings.filterwarnings('ignore')
+
+# ------- сюда впиши свои станции, которые надо выкинуть -------
+EXCLUDED_STATIONS = {
+    'STPM',    'MGO4',    'THU2',    'SCH2',    'SNI1',    'GODN',    'WSLB',    'NRC1',    'LMMF',
+    'LPOC',
+    'TFNO',    'ABMF',    'ALGO',    'VNDP',    'BCOV',    'NANO',    'QAQ1',    'BCRK',    'COSO',    'CMP9',    'PTRF',    'WHC1',    'SFDM',    'NLIB',    'NCSB',
+    'GODE',       'GOLD',    'JEDY',    'WES2',    'SSIA',    'NIST',    'ALB4',    'GOL2',    'ROCK',    'ALBH',    'DIBT',    'MGRB',    'MGO6',
+    'SGPO',    'CIT1',    'EIL3',    'YELL',    'QUIN',     'EIL4',
+    'WIDC',    'SEUS',    'MGO2',    'BARH',    'GODS',    'PRD3',    'ATLI',    'P053',   'PTAL',    'AMC4',    'YEL3',    'TORP',
+    'SHPB',    'QUAD',    'KOUG',    'IQAL',    'STFU',    'RDSD',    'CHUR',    'PICL',    'LBCH',    'CHWK',    'USN8',    'KLSQ',
+    'GCGO',       'PRDS',    'DUBO',    'JPLM',
+    'KSU1',    'MGO3',    'DR2O',    'CLRS',    'WILL',    'WDC6',    'GODR',    'STJ2',    'MRIB',    'HOLB',    'BILL',    'SC04',
+    'INVK',    'RTS2',    'BREW',    'P043',    'UCLP',    'NTKA',    'P389',    'PRD2',    'BAIE',    'BAMF',    'AL2H',    'FAIR',    'CHU2',
+    'WHIT',    'SABY',
+    'PIE1',    'JORD',    'EUR2',    'UCLU',    'ESCU',    'TAHB',    'APO1',    'STJO',    'DRAO',    'ALG3',    'TRAK',
+}
+
 
 def load_station_coords(coord_file):
     """Загрузка координат станций"""
@@ -22,8 +41,15 @@ def load_station_coords(coord_file):
     return stations
 
 
-def load_vtec_data(data_dir, hour_start, hour_end, stations_coords):
-    """Загрузка данных VTEC за указанный временной интервал"""
+def load_vtec_data(data_dir, hour_start, hour_end, stations_coords,
+                   exclude_stations=None):
+    """
+    Загрузка данных VTEC за указанный временной интервал.
+    exclude_stations: множество имён станций, которые НЕ использовать.
+    """
+    if exclude_stations is None:
+        exclude_stations = set()
+
     data = []
 
     for station_path in Path(data_dir).iterdir():
@@ -33,23 +59,27 @@ def load_vtec_data(data_dir, hour_start, hour_end, stations_coords):
         station_name = station_path.name
         if station_name not in stations_coords:
             continue
+        if station_name in exclude_stations:
+            # эту станцию специально выкидываем
+            continue
 
         station_lon, station_lat = stations_coords[station_name]
         data_file = station_path / f"{station_name}_{data_dir}_2025.dat"
-
         if not data_file.exists():
             continue
 
-        df = pd.read_csv(data_file, delim_whitespace=True, comment='#',
-                         names=['UT', 'I_v', 'G_lon', 'G_lat', 'G_q_lon',
-                                'G_q_lat', 'G_t', 'G_q_t'])
+        df = pd.read_csv(
+            data_file,
+            delim_whitespace=True,
+            comment='#',
+            names=['UT', 'I_v', 'G_lon', 'G_lat',
+                   'G_q_lon', 'G_q_lat', 'G_t', 'G_q_t']
+        )
 
-        # Фильтрация по времени и удаление нулевых значений
         mask = (df['UT'] >= hour_start) & (df['UT'] <= hour_end) & (df['I_v'] > 0)
         df_filtered = df[mask]
 
         if len(df_filtered) > 0:
-            # Используем среднее значение за интервал
             avg_vtec = df_filtered['I_v'].mean()
             data.append([station_lon, station_lat, avg_vtec])
 
@@ -57,8 +87,7 @@ def load_vtec_data(data_dir, hour_start, hour_end, stations_coords):
 
 
 def create_distance_weight_matrix(lats, lons, k_neighbors=5):
-    """Создание весовой матрицы на основе плотности станций"""
-    # Преобразуем в 3D координаты на единичной сфере
+    """Весовая матрица по плотности станций"""
     colat = 90.0 - lats
     theta = np.radians(colat)
     phi = np.radians(lons)
@@ -66,19 +95,14 @@ def create_distance_weight_matrix(lats, lons, k_neighbors=5):
     x = np.sin(theta) * np.cos(phi)
     y = np.sin(theta) * np.sin(phi)
     z = np.cos(theta)
-
     coords_3d = np.column_stack([x, y, z])
-    tree = cKDTree(coords_3d)
 
-    # Расстояние до k-го соседа как мера плотности
-    k = min(k_neighbors, len(lats) // 10)
+    tree = cKDTree(coords_3d)
+    k = min(k_neighbors, max(1, len(lats) // 10))
     if k > 0:
-        distances, _ = tree.query(coords_3d, k=k + 1)  # +1 для исключения самой точки
-        # Среднее расстояние до k ближайших соседей
+        distances, _ = tree.query(coords_3d, k=k + 1)
         mean_distances = distances[:, 1:].mean(axis=1)
-        # Веса обратно пропорциональны плотности
         weights = 1.0 / (mean_distances + 1e-10)
-        # Нормализуем так, чтобы средний вес был 1
         weights = weights / weights.mean()
     else:
         weights = np.ones(len(lats))
@@ -86,20 +110,11 @@ def create_distance_weight_matrix(lats, lons, k_neighbors=5):
     return weights
 
 
-def create_vtec_map_with_ocean_constraint(data, lmax=8, ocean_smooth_factor=3.0):
+def create_vtec_map_with_ocean_constraint(data, lmax=5, ocean_smooth_factor=4.0):
     """
-    Создание карты VTEC с ограничениями для океанических областей
-
-    Parameters:
-    -----------
-    data : ndarray
-        Массив [lon, lat, vtec]
-    lmax : int
-        Максимальная степень сферических гармоник
-    ocean_smooth_factor : float
-        Коэффициент сглаживания для океанических областей (чем больше, тем сильнее)
+    Создание карты VTEC по SH + сглаживание океанов
+    data: [lon, lat, vtec]
     """
-
     if len(data) == 0:
         return None
 
@@ -109,71 +124,65 @@ def create_vtec_map_with_ocean_constraint(data, lmax=8, ocean_smooth_factor=3.0)
 
     print(f"Создание карты VTEC (lmax={lmax})")
     print(f"Количество станций: {len(values)}")
-    print(f"VTEC: mean={values.mean():.2f}, std={values.std():.2f}, "
-          f"min={values.min():.2f}, max={values.max():.2f}")
+    print(
+        f"VTEC: mean={values.mean():.2f}, std={values.std():.2f}, "
+        f"min={values.min():.2f}, max={values.max():.2f}"
+    )
 
-    # 1. Создаем веса для компенсации неравномерного распределения
     weights = create_distance_weight_matrix(lats, lons, k_neighbors=5)
 
-    # 2. Создаем матрицу дизайна согласно формуле (1)
     n_points = len(values)
-
-    # Количество коэффициентов: для каждой степени n от 0 до lmax
-    # и для каждого порядка m от 0 до n (C_nm и S_nm для m>0)
     n_coeffs = (lmax + 1) ** 2
 
     A = np.zeros((n_points, n_coeffs))
 
+    # используем широту (sin(phi)) и долготу в радианах
     sin_phi = np.sin(np.radians(lats))
     lambda_rad = np.radians(lons)
 
     idx = 0
     for n in range(lmax + 1):
         for m in range(n + 1):
-            # Нормализованная присоединенная функция Лежандра P_n^m(sin φ)
             P_nm = lpmv(m, n, sin_phi)
 
-            # Нормализация для геодезических приложений
             if m == 0:
                 norm = np.sqrt(2 * n + 1)
             else:
                 from math import factorial
-                norm = np.sqrt((2 * n + 1) * factorial(n - m) / factorial(n + m))
-
+                norm = np.sqrt(
+                    (2 * n + 1) * factorial(n - m) / factorial(n + m)
+                )
             P_nm_norm = P_nm * norm
 
             if m == 0:
-                # Только косинусная часть для m=0: C_n0 * P_n0
                 A[:, idx] = P_nm_norm
                 idx += 1
             else:
-                # C_nm * P_nm * cos(mλ)
                 A[:, idx] = P_nm_norm * np.cos(m * lambda_rad)
                 idx += 1
-
-                # S_nm * P_nm * sin(mλ)
                 A[:, idx] = P_nm_norm * np.sin(m * lambda_rad)
                 idx += 1
 
-    # 3. Создаем матрицу регуляризации для подавления артефактов в океанах
-    # Сильнее штрафуем высокие степени (быстрые колебания)
+    # Регуляризация версии 1.0
     L = np.zeros((n_coeffs, n_coeffs))
-
     idx = 0
     for n in range(lmax + 1):
-        # Регуляризация растет как n^3 для высоких гармоник
-        reg_strength = 0.001 * (1 + n ** 3)
-
+        if n <= 2:
+            reg_strength = 0.01 * (1 + n**2)
+        elif n == 3:
+            reg_strength = 0.1 * (1 + n**3)
+        elif n == 4:
+            reg_strength = 0.3 * (1 + n**3)
+        else:  # n >= 5
+            reg_strength = 0.6 * (1 + n**4)
         for m in range(n + 1):
             L[idx, idx] = reg_strength
             idx += 1 if m == 0 else 2
 
-    # 4. Взвешенные наименьшие квадраты с регуляризацией
     W = np.diag(weights)
     lhs = A.T @ W @ A + L
     rhs = A.T @ W @ values
 
-    # Решаем систему
     try:
         coeffs = np.linalg.solve(lhs, rhs)
     except np.linalg.LinAlgError:
@@ -181,8 +190,8 @@ def create_vtec_map_with_ocean_constraint(data, lmax=8, ocean_smooth_factor=3.0)
 
     print(f"C00 (средний уровень): {coeffs[0]:.4f}")
 
-    # 5. Восстанавливаем на глобальной сетке
-    res = 2.0  # разрешение в градусах
+    # Сетка по широте: от -90 до +80 с шагом 2°
+    res = 2.0
     grid_lats = np.arange(-90, 90 + res, res)
     grid_lons = np.arange(0, 360 + res, res)
 
@@ -192,23 +201,23 @@ def create_vtec_map_with_ocean_constraint(data, lmax=8, ocean_smooth_factor=3.0)
 
     sin_phi_grid = np.sin(np.radians(grid_lats))
 
-    # Восстановление значений на сетке
     for i in range(nlat):
+        sin_phi_i = sin_phi_grid[i]
         for j in range(nlon):
             tec_value = 0.0
             lambda_grid = np.radians(grid_lons[j])
-            idx = 0
 
+            idx = 0
             for n in range(lmax + 1):
                 for m in range(n + 1):
-                    P_nm = lpmv(m, n, sin_phi_grid[i])
-
+                    P_nm = lpmv(m, n, sin_phi_i)
                     if m == 0:
                         norm = np.sqrt(2 * n + 1)
                     else:
                         from math import factorial
-                        norm = np.sqrt((2 * n + 1) * factorial(n - m) / factorial(n + m))
-
+                        norm = np.sqrt(
+                            (2 * n + 1) * factorial(n - m) / factorial(n + m)
+                        )
                     P_nm_norm = P_nm * norm
 
                     if m == 0:
@@ -222,296 +231,292 @@ def create_vtec_map_with_ocean_constraint(data, lmax=8, ocean_smooth_factor=3.0)
 
             grid[i, j] = tec_value
 
-    # 6. Применяем сглаживание в областях без станций
+    # Сглаживание океанов
     grid = apply_ocean_smoothing(grid, grid_lats, grid_lons, data, ocean_smooth_factor)
 
-    # 7. Ограничиваем физически возможные значения
+    # Ограничение диапазона
     vtec_mean = values.mean()
     vtec_std = values.std()
-
-    # VTEC не может быть отрицательным
     grid[grid < 0] = 0
-
-    # Ограничиваем сверху разумным значением
     upper_limit = min(100, vtec_mean + 3 * vtec_std)
     grid[grid > upper_limit] = upper_limit
 
-    print(f"Итоговая карта: mean={grid.mean():.2f}, std={grid.std():.2f}, "
-          f"min={grid.min():.2f}, max={grid.max():.2f}")
+    print(
+        f"Итоговая карта: mean={grid.mean():.2f}, std={grid.std():.2f}, "
+        f"min={grid.min():.2f}, max={grid.max():.2f}"
+    )
 
     return grid, grid_lats, grid_lons
 
 
-def apply_ocean_smoothing(grid, grid_lats, grid_lons, station_data, smooth_factor=3.0):
-    """
-    Применяет сглаживание в областях далеких от станций
-
-    Parameters:
-    -----------
-    grid : ndarray
-        Исходная сетка VTEC
-    grid_lats, grid_lons : ndarray
-        Координаты сетки
-    station_data : ndarray
-        Данные станций [lon, lat, vtec]
-    smooth_factor : float
-        Коэффициент сглаживания
-    """
-
-    # Создаем маску: 1 где есть станции поблизости, 0 где нет
+def apply_ocean_smoothing(grid, grid_lats, grid_lons,
+                          station_data, smooth_factor=4.0):
+    """Сглаживание в областях далеко от станций"""
     station_mask = np.zeros_like(grid, dtype=bool)
-    radius_deg = 15.0  # радиус влияния станции
+    radius_deg = 15.0
 
     for i, lat in enumerate(grid_lats):
         for j, lon in enumerate(grid_lons):
-            # Находим расстояние до ближайшей станции
             distances = np.sqrt(
                 (station_data[:, 1] - lat) ** 2 +
-                ((station_data[:, 0] - lon + 180) % 360 - 180) ** 2
+                (((station_data[:, 0] - lon + 180) % 360) - 180) ** 2
             )
-            min_distance = distances.min()
-
-            # Если есть станция в пределах радиуса
-            if min_distance < radius_deg:
+            if distances.min() < radius_deg:
                 station_mask[i, j] = True
 
-    # Расстояние до ближайшей станции (в градусах)
     from scipy.ndimage import distance_transform_edt
-
-    # Для distance_transform нужно преобразовать в бинарную маску
     binary_mask = station_mask.astype(float)
-
-    # Расстояние в пикселях
-    # 1 градус ≈ 111 км, но для сглаживания используем пиксели
     distances_px = distance_transform_edt(1 - binary_mask)
 
-    # Применяем сглаживание, зависящее от расстояния
     smoothed_grid = grid.copy()
-
-    # Области без станций сглаживаем сильнее
     max_sigma = smooth_factor
+
     for i in range(grid.shape[0]):
         for j in range(grid.shape[1]):
             if not station_mask[i, j] and distances_px[i, j] > 0:
-                # Сила сглаживания зависит от расстояния до станций
                 sigma = min(max_sigma, distances_px[i, j] / 5.0)
-
-                # Определяем окно для сглаживания
                 i_min = max(0, int(i - 2 * sigma))
                 i_max = min(grid.shape[0], int(i + 2 * sigma) + 1)
                 j_min = max(0, int(j - 2 * sigma))
                 j_max = min(grid.shape[1], int(j + 2 * sigma) + 1)
-
-                # Локальное среднее
                 window = grid[i_min:i_max, j_min:j_max]
                 if window.size > 0:
                     smoothed_grid[i, j] = np.mean(window)
 
-    # Слегка сглаживаем всю карту для устранения резких переходов
     smoothed_grid = gaussian_filter(smoothed_grid, sigma=0.5)
-
     return smoothed_grid
 
 
-def plot_vtec_map_with_stations(grid, lat_grid, lon_grid, station_data, title):
-    """Визуализация карты VTEC со станциями"""
-
+def plot_vtec_map(grid, lat_grid, lon_grid, title, out_path, station_data=None):
+    """Глобальная карта VTEC + (опционально) точки станций"""
     fig = plt.figure(figsize=(16, 8))
     ax = plt.axes(projection=ccrs.PlateCarree())
 
-    # Сетка для отображения
     lon_mesh, lat_mesh = np.meshgrid(lon_grid, lat_grid)
-
-    # ФИКСИРОВАННАЯ шкала от 0 до 100 TECU
-    vmin = 0
-    vmax = 80
-
-    cmap = 'jet'
-
-    # Отображаем интерполированную карту VTEC
-    contour = ax.contourf(lon_mesh, lat_mesh, grid,
-                          transform=ccrs.PlateCarree(),
-                          cmap=cmap,  # Используем выбранную цветовую карту
-                          levels=np.linspace(vmin, vmax, 45),  # 50 интервалов
-                          vmin=vmin, vmax=vmax,
-                          extend='both')  # Показываем стрелки если значения вне диапазона
-
-
-    # Отображаем станции (раскомментируйте если нужно)
-    # scatter = ax.scatter(station_data[:, 0], station_data[:, 1],
-    #                     c=station_data[:, 2],
-    #                     s=40,
-    #                     cmap=cmap,  # Та же цветовая карта
-    #                     vmin=vmin, vmax=vmax,
-    #                     edgecolors='black', linewidth=0.5,
-    #                     transform=ccrs.PlateCarree(),
-    #                     zorder=10,
-    #                     label='GNSS станции')
-
-    # Добавляем границы
-    ax.coastlines(linewidth=0.8)
-    ax.add_feature(ccrs.cartopy.feature.OCEAN, alpha=0.1)
-    ax.add_feature(ccrs.cartopy.feature.LAND, alpha=0.1)
-
-    # Добавляем границы стран
-    ax.add_feature(ccrs.cartopy.feature.BORDERS, linewidth=0.5, alpha=0.5)
-
-    # Сетка
-    gl = ax.gridlines(draw_labels=True, linewidth=0.5, alpha=0.5,
-                      xlocs=range(-180, 181, 30), ylocs=range(-90, 91, 30))
-    gl.top_labels = False
-    gl.right_labels = False
-    gl.xlabel_style = {'size': 10}
-    gl.ylabel_style = {'size': 10}
-
-    # Цветовая шкала с фиксированными делениями
-    cbar = plt.colorbar(contour, ax=ax, orientation='horizontal',
-                        pad=0.05, shrink=0.8)
-    cbar.set_label('Vertical TEC (TECU)', fontsize=12, weight='bold')
-
-    # Устанавливаем фиксированные деления на цветовой шкале
-    cbar.set_ticks(np.arange(0, 81, 10))  # Деления каждые 10 TECU
-    cbar.set_ticklabels([f'{i}' for i in range(0, 81, 10)])
-
-    plt.title(title, fontsize=14, pad=20, weight='bold')
-    plt.tight_layout()
-
-    return fig, ax
-
-
-def plot_north_america_vtec(grid, lat_grid, lon_grid, station_data, title, hour_start, hour_end):
-    """Построение карты VTEC только для Северной Америки"""
-
-    # Область Северной Америки
-    na_extent = [-150, -40, 5, 80]
-
-    # Создаем фигуру
-    fig = plt.figure(figsize=(12, 8))
-    ax = plt.axes(projection=ccrs.PlateCarree())
-    ax.set_extent(na_extent, crs=ccrs.PlateCarree())
-
-    # Отображаем карту VTEC
     vmin, vmax = 0, 80
-    contour = ax.contourf(lon_grid, lat_grid, grid,
-                          transform=ccrs.PlateCarree(),
-                          cmap='jet',
-                          levels=np.linspace(vmin, vmax, 40),
-                          vmin=vmin, vmax=vmax,
-                          extend='both')
 
-    # Картографические элементы
+    contour = ax.contourf(
+        lon_mesh, lat_mesh, grid,
+        transform=ccrs.PlateCarree(),
+        cmap='jet',
+        levels=np.linspace(vmin, vmax, 45),
+        vmin=vmin, vmax=vmax,
+        extend='both'
+    )
+
+    # чёрные точки — станции
+    if station_data is not None and len(station_data) > 0:
+        lons_st = station_data[:, 0]
+        lats_st = station_data[:, 1]
+        ax.scatter(
+            lons_st, lats_st,
+            c='k', s=10, marker='o',
+            transform=ccrs.PlateCarree(),
+            zorder=3
+        )
+
     ax.coastlines(linewidth=0.8)
-    ax.add_feature(ccrs.cartopy.feature.OCEAN, alpha=0.1)
-    ax.add_feature(ccrs.cartopy.feature.LAND, alpha=0.1)
-
-    # Сетка
-    gl = ax.gridlines(draw_labels=True, linewidth=0.5, alpha=0.5)
-    gl.top_labels = False
-    gl.right_labels = False
+    ax.gridlines(draw_labels=True, linewidth=0.5, alpha=0.5)
 
     cbar = plt.colorbar(contour, ax=ax, orientation='horizontal',
                         pad=0.05, shrink=0.8)
-    cbar.set_label('Vertical TEC (TECU)')
-    cbar.set_ticks(range(0, 81, 10))
+    cbar.set_label('Vertical TEC (TECU)', fontsize=12)
 
-    plt.title(f'North America VTEC: {hour_end:02d} UT', fontsize=12, pad=15)
+    plt.title(title, fontsize=14, pad=20)
     plt.tight_layout()
-
-    output_dir = "north_america_maps"
-    Path(output_dir).mkdir(exist_ok=True)
-    output_file = f"{output_dir}/vtec_na_{hour_end:02d}.png"
-    plt.savefig(output_file, dpi=150, bbox_inches='tight')
+    Path(out_path).parent.mkdir(exist_ok=True, parents=True)
+    plt.savefig(out_path, dpi=150, bbox_inches='tight')
     plt.close(fig)
 
-    return output_file
+
+def plot_na_diff_self(diff_grid, lat_grid, lon_grid, hour_end):
+    """Разность full − cut для Северной Америки"""
+    na_lon_min, na_lon_max = -150, -40
+    na_lat_min, na_lat_max = 5, 80
+
+    lon_180 = (lon_grid % 360 + 180) % 360 - 180
+    Lon, Lat = np.meshgrid(lon_180, lat_grid)
+
+    lat_mask = (lat_grid >= na_lat_min) & (lat_grid <= na_lat_max)
+    lon_mask = (lon_180 >= na_lon_min) & (lon_180 <= na_lon_max)
+
+    diff_na = diff_grid[np.ix_(lat_mask, lon_mask)]
+    print(
+        "SELF NA shape:", diff_na.shape,
+        "nan frac:", np.isnan(diff_na).mean() if diff_na.size else None
+    )
+
+    if diff_na.size == 0 or np.isnan(diff_na).all():
+        print(" SELF NA diff пустая/NaN, карту не рисую")
+        return
+
+    lat_na = lat_grid[lat_mask]
+    lon_na = lon_180[lon_mask]
+    Lon_na, Lat_na = np.meshgrid(lon_na, lat_na)
+
+    print(
+        f" ΔVTEC SELF NA: min={np.nanmin(diff_na):.2f}, "
+        f"max={np.nanmax(diff_na):.2f}, "
+        f"mean={np.nanmean(diff_na):.2f}, "
+        f"std={np.nanstd(diff_na):.2f}"
+    )
+
+    fig = plt.figure(figsize=(10, 8))
+    ax = plt.axes(projection=ccrs.PlateCarree())
+    ax.set_extent([na_lon_min, na_lon_max, na_lat_min, na_lat_max],
+                  crs=ccrs.PlateCarree())
+
+    vmax = 10.0
+    im = ax.contourf(
+        Lon_na, Lat_na, diff_na,
+        levels=np.linspace(-vmax, vmax, 41),
+        cmap='bwr',
+        vmin=-vmax, vmax=vmax,
+        transform=ccrs.PlateCarree(),
+        extend='both'
+    )
+
+    ax.coastlines(linewidth=0.8)
+    ax.gridlines(draw_labels=True, linewidth=0.5, alpha=0.5)
+
+    cbar = plt.colorbar(im, ax=ax, orientation='horizontal',
+                        pad=0.05, shrink=0.8)
+    cbar.set_label('ΔVTEC (full − cut), TECU')
+
+    Path("diff_self_na").mkdir(exist_ok=True)
+    out = f"diff_self_na/diff_self_na_{hour_end:02d}.png"
+    plt.savefig(out, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print(" SELF NA diff карта сохранена:", out)
+
+
+def plot_global_diff_self(diff_grid, lat_grid, lon_grid, hour_end):
+    """Глобальная разность full − cut"""
+    Lon, Lat = np.meshgrid(lon_grid, lat_grid)
+
+    print(
+        f" ΔVTEC SELF GLOBAL: min={np.nanmin(diff_grid):.2f}, "
+        f"max={np.nanmax(diff_grid):.2f}, "
+        f"mean={np.nanmean(diff_grid):.2f}, "
+        f"std={np.nanstd(diff_grid):.2f}"
+    )
+
+    fig = plt.figure(figsize=(14, 6))
+    ax = plt.axes(projection=ccrs.PlateCarree())
+    ax.set_global()
+
+    vmax = 10.0
+    im = ax.contourf(
+        Lon, Lat, diff_grid,
+        levels=np.linspace(-vmax, vmax, 41),
+        cmap='bwr',
+        vmin=-vmax, vmax=vmax,
+        transform=ccrs.PlateCarree(),
+        extend='both'
+    )
+
+    ax.coastlines(linewidth=0.8)
+    ax.gridlines(draw_labels=True, linewidth=0.5, alpha=0.5)
+
+    cbar = plt.colorbar(im, ax=ax, orientation='horizontal',
+                        pad=0.05, shrink=0.8)
+    cbar.set_label('ΔVTEC (full − cut), TECU')
+
+    Path("diff_self_global").mkdir(exist_ok=True)
+    out = f"diff_self_global/diff_self_global_{hour_end:02d}.png"
+    plt.savefig(out, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print(" SELF global diff карта сохранена:", out)
 
 
 def main():
-    """Основная функция - все интервалы"""
-    data_dir = "321"
+    data_dir = "320"
     coord_file = "tec_suite_coords.txt"
+
     lmax_val = 5
-    smooth_factor = 3.0
+    smooth_factor = 4.0
 
-    print("Построение карт VTEC...")
-
+    print("Построение карт VTEC (full и cut)...")
     stations_coords = load_station_coords(coord_file)
-    print(f"Станций: {len(stations_coords)}")
+    print(f"Станций в координатах: {len(stations_coords)}")
 
     intervals = [(i, i + 2) for i in range(0, 24, 2)]
 
-    Path("global_maps").mkdir(exist_ok=True)
-    Path("north_america_maps").mkdir(exist_ok=True)
+    Path("global_maps_full").mkdir(exist_ok=True)
+    Path("global_maps_cut").mkdir(exist_ok=True)
 
     successful = 0
+
+    ionex_file = "code_Data/COD0OPSFIN_20253200000_01D_01H_GIM.INX"
+    tec_maps = read_ionex_fixed(ionex_file)
 
     for hour_start, hour_end in intervals:
         print(f"\nИнтервал: {hour_start:02d}-{hour_end:02d} UT")
 
-        # Данные
-        vtec_data = load_vtec_data(data_dir, hour_start, hour_end, stations_coords)
+        # Полная сеть
+        vtec_full = load_vtec_data(
+            data_dir, hour_start, hour_end, stations_coords,
+            exclude_stations=set()
+        )
+        # Усечённая сеть (без выбранных станций)
+        vtec_cut = load_vtec_data(
+            data_dir, hour_start, hour_end, stations_coords,
+            exclude_stations=EXCLUDED_STATIONS
+        )
 
-        if len(vtec_data) < 10:
-            print(f"  Мало данных: {len(vtec_data)} точек")
+        print(f" Данных FULL: {len(vtec_full)} точек")
+        print(f" Данных CUT : {len(vtec_cut)} точек")
+
+        if len(vtec_full) < 10 or len(vtec_cut) < 10:
+            print(" Мало данных для full или cut, пропускаю интервал")
             continue
 
-        print(f"  Данных: {len(vtec_data)} точек")
-
         try:
-            result = create_vtec_map_with_ocean_constraint(
-                vtec_data, lmax=lmax_val, ocean_smooth_factor=smooth_factor)
+            res_full = create_vtec_map_with_ocean_constraint(
+                vtec_full, lmax=lmax_val, ocean_smooth_factor=smooth_factor
+            )
+            res_cut = create_vtec_map_with_ocean_constraint(
+                vtec_cut, lmax=lmax_val, ocean_smooth_factor=smooth_factor
+            )
 
-            if result:
-                grid, lat_grid, lon_grid = result
+            if res_full and res_cut:
+                grid_full, lat_grid, lon_grid = res_full
+                grid_cut, lat_grid2, lon_grid2 = res_cut
 
-                fig, ax = plot_vtec_map_with_stations(
-                    grid, lat_grid, lon_grid, vtec_data,
-                    f"VTEC: {hour_end:02d} UT"
+                # сетки должны совпадать
+                if not (np.array_equal(lat_grid, lat_grid2) and
+                        np.array_equal(lon_grid, lon_grid2)):
+                    print(" Предупреждение: lat/lon сетки full и cut не совпадают, пропускаю diff")
+                    continue
+
+                # сохраняем обе карты с точками станций
+                plot_vtec_map(
+                    grid_full, lat_grid, lon_grid,
+                    f"VTEC FULL: {hour_end:02d} UT",
+                    f"global_maps_full/vtec_full_{hour_end:02d}.png",
+                    station_data=vtec_full
                 )
-                plt.savefig(f"global_maps/vtec_{hour_end:02d}.png",
-                            dpi=150, bbox_inches='tight')
-                plt.close(fig)
-
-                # Северная Америка
-                plot_north_america_vtec(
-                    grid, lat_grid, lon_grid, vtec_data,
-                    "", hour_start, hour_end
+                plot_vtec_map(
+                    grid_cut, lat_grid, lon_grid,
+                    f"VTEC CUT : {hour_end:02d} UT",
+                    f"global_maps_cut/vtec_cut_{hour_end:02d}.png",
+                    station_data=vtec_cut
                 )
+
+                # разность full − cut
+                diff_grid = grid_full - grid_cut
+
+                plot_global_diff_self(diff_grid, lat_grid, lon_grid, hour_end)
+                plot_na_diff_self(diff_grid, lat_grid, lon_grid, hour_end)
 
                 successful += 1
-                print(f"Карты построены")
+                print("Карты построены")
 
         except Exception as e:
             print(f"Ошибка: {e}")
 
     print(f"\nГотово! Успешно: {successful}/{len(intervals)} интервалов")
 
-
-def save_grid_data(grid, lat_grid, lon_grid, hour_start, hour_end, output_dir):
-    """Сохранение данных карты в текстовый файл"""
-    try:
-        # Создаем файл для данных
-        data_file = f"{output_dir}/vtec_{hour_end:02d}_data.txt"
-
-        with open(data_file, 'w') as f:
-            f.write(f"# VTEC Data: {hour_start:02d}:00 - {hour_end:02d}:00 UT\n")
-            f.write(f"# Latitudes: {len(lat_grid)} points from {lat_grid[0]} to {lat_grid[-1]}\n")
-            f.write(f"# Longitudes: {len(lon_grid)} points from {lon_grid[0]} to {lon_grid[-1]}\n")
-            f.write(f"# Grid shape: {grid.shape}\n")
-            f.write(f"# Statistics: min={grid.min():.2f}, max={grid.max():.2f}, "
-                    f"mean={grid.mean():.2f}, std={grid.std():.2f}\n")
-            f.write("#" * 50 + "\n")
-            f.write("# Longitude Latitude VTEC\n")
-
-            # Записываем данные построчно
-            for i, lat in enumerate(lat_grid):
-                for j, lon in enumerate(lon_grid):
-                    f.write(f"{lon:8.2f} {lat:8.2f} {grid[i, j]:8.2f}\n")
-
-        print(f"  Данные сохранены в {data_file}")
-
-    except Exception as e:
-        print(f" Не удалось сохранить данные: {e}")
 
 if __name__ == "__main__":
     main()
